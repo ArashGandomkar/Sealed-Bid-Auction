@@ -2,11 +2,13 @@
 pragma solidity ^0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract SealedBidAuction is Ownable, ReentrancyGuard {
 
+contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant MIN_DURATION = 12 hours;
+    uint256 public _auctionId = 1;
 
     struct Auction {
         address beneficiary;
@@ -21,7 +23,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         uint256 reservePrice;
     }
     mapping (uint256 => Auction) public auctions;
-    uint256 public _auctionId = 1;
+    
 
     struct Bidder {
         bytes32 commitment;
@@ -31,7 +33,9 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         bool committed;
         bool revealed;
         bool settled;
+        bool bidRevised;
     }
+    
     mapping (uint256 => mapping (address => Bidder)) private bidders;
     mapping (uint256 => mapping (address => uint256)) public pendingWithdrawals;
 
@@ -59,6 +63,8 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
     error AuctionHasBids();
     error CancellationClosed();
     error BidBelowReservePrice();
+    error BidAlreadyRevised();
+    error InsufficientDeposit();
 
     event BidCommitted(address indexed bidder, uint256 indexed auctionId);
     event BidRevealed(address indexed bidder,uint256 indexed auctionId, uint256 bid);
@@ -68,7 +74,13 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
     event AuctionCreated(uint256 indexed auctionId, address indexed beneficiary, uint256 commitEnd, uint256 revealEnd);
     event AuctionCancelled(uint256 indexed auctionId);
 
-    constructor() Ownable(msg.sender) {
+    constructor() Ownable(msg.sender) {}
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     function makeCommitment(uint256 bid, bytes32 secret, uint256 auctionId) external view returns(bytes32) {
@@ -86,7 +98,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         );
     }
 
-    function commitBid(bytes32 _commitment, uint256 auctionId) external payable {
+    function commitBid(bytes32 _commitment, uint256 auctionId) external payable whenNotPaused {
         if (!auctions[auctionId].exists) revert AuctionNotFound();
         if (auctions[auctionId].cancelled) revert AuctionAlreadyCancelled();
         if (block.timestamp >= auctions[auctionId].commitEnd) revert CommitPhaseClosed();
@@ -101,12 +113,13 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
             revealedBid: 0,
             committed: true,
             revealed: false,
-            settled: false
+            settled: false,
+            bidRevised: false
         });
         emit BidCommitted(msg.sender, auctionId);
     }
 
-    function revealBid(uint256 bid, bytes32 secret, uint256 auctionId) external {
+    function revealBid(uint256 bid, bytes32 secret, uint256 auctionId) external whenNotPaused {
         if (!auctions[auctionId].exists) revert AuctionNotFound();
         if (auctions[auctionId].cancelled) revert AuctionAlreadyCancelled();
         if (block.timestamp < auctions[auctionId].commitEnd) revert RevealPhaseNotOpen();
@@ -131,7 +144,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         if (expected != b.commitment) revert  InvalidReveal();
         b.revealed = true;
         b.revealedBid = bid;
-        
+
         bool isBetter =
             bid > auctions[auctionId].highestBid ||
             (
@@ -149,7 +162,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         emit BidRevealed(msg.sender, auctionId, bid);
     }
 
-    function finalize(uint auctionId) external {
+    function finalize(uint auctionId) external whenNotPaused {
         if (!auctions[auctionId].exists) revert AuctionNotFound();
         if (auctions[auctionId].cancelled) revert AuctionAlreadyCancelled();
         if (block.timestamp < auctions[auctionId].revealEnd) {
@@ -212,7 +225,8 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
             uint256 revealedBid,
             bool committed,
             bool revealed,
-            bool settled
+            bool settled,
+            bool bidRevised
         )
     {
         if (!auctions[auctionId].exists) revert AuctionNotFound();
@@ -223,11 +237,12 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
             b.revealedBid,
             b.committed,
             b.revealed,
-            b.settled
+            b.settled,
+            b.bidRevised
         );
     }
 
-    function createAuction(address _beneficiary, uint256 commitDuration, uint256 revealDuration, uint256 _reservePrice) external onlyOwner returns (uint256 auctionId) {
+    function createAuction(address _beneficiary, uint256 commitDuration, uint256 revealDuration, uint256 _reservePrice) external onlyOwner whenNotPaused returns(uint256 auctionId) {
         if (_beneficiary == address(0)) revert ZeroAddress();
         if (commitDuration == 0 || revealDuration == 0) {
             revert InvalidDuration();
@@ -264,5 +279,26 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
 
         auction.cancelled = true;
         emit AuctionCancelled(auctionId);
+    }
+
+    function reviseBid(
+        uint256 auctionId,
+        bytes32 newCommitment
+    ) external payable whenNotPaused nonReentrant {
+        Auction storage auction = auctions[auctionId];
+        Bidder storage b = bidders[auctionId][msg.sender];
+        if (!auction.exists) revert AuctionNotFound();
+        if (auction.cancelled) revert AuctionAlreadyCancelled();
+        if (block.timestamp >= auction.commitEnd) revert CancellationClosed();
+        if (!b.committed) revert NoCommitment();
+        if (b.bidRevised) revert BidAlreadyRevised();
+        if (newCommitment == bytes32(0)) revert InvalidCommitment();
+
+        uint256 newDeposit = b.deposit + msg.value;
+        if (newDeposit < auction.reservePrice) revert InsufficientDeposit();
+
+        b.commitment = newCommitment;
+        b.deposit = newDeposit;
+        b.bidRevised = true;
     }
 }
