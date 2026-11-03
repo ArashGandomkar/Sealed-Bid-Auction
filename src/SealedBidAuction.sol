@@ -5,10 +5,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract SealedBidAuction is Ownable, ReentrancyGuard {
-    //mapping(address => bool) public userPaid;
-    //address public immutable beneficiary;
-    //uint256 public immutable commitEnd;
-    //uint256 public immutable revealEnd;
+
     uint256 public constant MIN_DURATION = 12 hours;
 
     struct Auction {
@@ -21,10 +18,10 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         bool finalized;
         bool exists;
         bool cancelled;
+        uint256 reservePrice;
     }
     mapping (uint256 => Auction) public auctions;
     uint256 public _auctionId = 1;
-    //bool public finalized;
 
     struct Bidder {
         bytes32 commitment;
@@ -37,9 +34,6 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
     }
     mapping (uint256 => mapping (address => Bidder)) private bidders;
     mapping (uint256 => mapping (address => uint256)) public pendingWithdrawals;
-
-    //address public highestBidder;
-    //uint256 public highestBid;
 
     error ZeroAddress();
     error InvalidDuration();
@@ -64,6 +58,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
     error AuctionAlreadyCancelled();
     error AuctionHasBids();
     error CancellationClosed();
+    error BidBelowReservePrice();
 
     event BidCommitted(address indexed bidder, uint256 indexed auctionId);
     event BidRevealed(address indexed bidder,uint256 indexed auctionId, uint256 bid);
@@ -73,30 +68,12 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
     event AuctionCreated(uint256 indexed auctionId, address indexed beneficiary, uint256 commitEnd, uint256 revealEnd);
     event AuctionCancelled(uint256 indexed auctionId);
 
-    constructor(/*address _beneficiary, uint256 commitDuration, uint256 revealDuration*/) Ownable(msg.sender) {
-        /*
-        if (_beneficiary == address(0)) revert ZeroAddress();
-        if (commitDuration == 0 || revealDuration == 0) {
-            revert InvalidDuration();
-        }
-        uint256 _commitEnd = block.timestamp + commitDuration;
-        auctions[_auctionId] = Auction({
-            beneficiary : _beneficiary,
-            commitEnd : _commitEnd,
-            revealEnd : _commitEnd + revealDuration,
-            nextCommitOrder : 0,
-            highestBidder : address(0),
-            highestBid: 0,
-            finalized : false
-        });
-        //beneficiary = _beneficiary;
-        //commitEnd = block.timestamp + commitDuration;
-        //revealEnd = commitEnd + revealDuration;
-        _auctionId++;
-        */
+    constructor() Ownable(msg.sender) {
     }
 
     function makeCommitment(uint256 bid, bytes32 secret, uint256 auctionId) external view returns(bytes32) {
+        if (!auctions[auctionId].exists) revert AuctionNotFound();
+        if (bid < auctions[auctionId].reservePrice) revert BidBelowReservePrice();
         return keccak256(
             abi.encode(
                 auctionId,
@@ -134,6 +111,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         if (auctions[auctionId].cancelled) revert AuctionAlreadyCancelled();
         if (block.timestamp < auctions[auctionId].commitEnd) revert RevealPhaseNotOpen();
         if (block.timestamp >= auctions[auctionId].revealEnd) revert RevealPhaseClosed();
+        if (bid < auctions[auctionId].reservePrice) revert BidBelowReservePrice();
 
         Bidder storage b = bidders[auctionId][msg.sender];
         if (!b.committed) revert NoCommitment();
@@ -153,8 +131,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         if (expected != b.commitment) revert  InvalidReveal();
         b.revealed = true;
         b.revealedBid = bid;
-        //uint256 highestBid = auctions[auctionId].highestBid;
-        //uint256 highestBider = auctions[auctionId].highestBider;
+        
         bool isBetter =
             bid > auctions[auctionId].highestBid ||
             (
@@ -250,7 +227,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
         );
     }
 
-    function createAuction(address _beneficiary, uint256 commitDuration, uint256 revealDuration) external onlyOwner returns (uint256 auctionId) {
+    function createAuction(address _beneficiary, uint256 commitDuration, uint256 revealDuration, uint256 _reservePrice) external onlyOwner returns (uint256 auctionId) {
         if (_beneficiary == address(0)) revert ZeroAddress();
         if (commitDuration == 0 || revealDuration == 0) {
             revert InvalidDuration();
@@ -270,7 +247,8 @@ contract SealedBidAuction is Ownable, ReentrancyGuard {
             highestBid: 0,
             finalized : false,
             exists : true,
-            cancelled : false
+            cancelled : false,
+            reservePrice : _reservePrice
         });
         _auctionId++;
         emit AuctionCreated(auctionId, _beneficiary, _commitEnd, _revealEnd);
