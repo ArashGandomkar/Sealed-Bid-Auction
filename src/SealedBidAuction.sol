@@ -64,7 +64,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
     error CancellationClosed();
     error BidBelowReservePrice();
     error BidAlreadyRevised();
-    error InsufficientDeposit();
+    error DepositBelowReservePrice();
 
     event BidCommitted(address indexed bidder, uint256 indexed auctionId);
     event BidRevealed(address indexed bidder,uint256 indexed auctionId, uint256 bid);
@@ -73,6 +73,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
     event Withdrawal(address indexed account, uint256 indexed auctionId, uint256 amount);
     event AuctionCreated(uint256 indexed auctionId, address indexed beneficiary, uint256 commitEnd, uint256 revealEnd);
     event AuctionCancelled(uint256 indexed auctionId);
+    event BidRevised(address indexed bidder, uint256 indexed auctionId);
 
     constructor() Ownable(msg.sender) {}
 
@@ -119,7 +120,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         emit BidCommitted(msg.sender, auctionId);
     }
 
-    function revealBid(uint256 bid, bytes32 secret, uint256 auctionId) external whenNotPaused {
+    function revealBid(uint256 bid, bytes32 secret, uint256 auctionId) external {
         if (!auctions[auctionId].exists) revert AuctionNotFound();
         if (auctions[auctionId].cancelled) revert AuctionAlreadyCancelled();
         if (block.timestamp < auctions[auctionId].commitEnd) revert RevealPhaseNotOpen();
@@ -162,7 +163,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         emit BidRevealed(msg.sender, auctionId, bid);
     }
 
-    function finalize(uint auctionId) external whenNotPaused {
+    function finalize(uint auctionId) external {
         if (!auctions[auctionId].exists) revert AuctionNotFound();
         if (auctions[auctionId].cancelled) revert AuctionAlreadyCancelled();
         if (block.timestamp < auctions[auctionId].revealEnd) {
@@ -289,16 +290,19 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         Bidder storage b = bidders[auctionId][msg.sender];
         if (!auction.exists) revert AuctionNotFound();
         if (auction.cancelled) revert AuctionAlreadyCancelled();
-        if (block.timestamp >= auction.commitEnd) revert CancellationClosed();
+        if (block.timestamp >= auction.commitEnd) revert CommitPhaseClosed();
         if (!b.committed) revert NoCommitment();
         if (b.bidRevised) revert BidAlreadyRevised();
         if (newCommitment == bytes32(0)) revert InvalidCommitment();
+        if (newCommitment == b.commitment) revert InvalidCommitment();
 
         uint256 newDeposit = b.deposit + msg.value;
-        if (newDeposit < auction.reservePrice) revert InsufficientDeposit();
+        if (newDeposit < auction.reservePrice) revert DepositBelowReservePrice();
 
         b.commitment = newCommitment;
         b.deposit = newDeposit;
         b.bidRevised = true;
+
+        emit BidRevised(msg.sender, auctionId);
     }
 }
