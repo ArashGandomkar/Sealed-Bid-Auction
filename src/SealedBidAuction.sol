@@ -10,6 +10,48 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant MIN_DURATION = 12 hours;
     uint256 public _auctionId = 1;
 
+    enum AuctionState {
+        Created,
+        CommitPhase,
+        RevealPhase,
+        Ended,
+        Finalized,
+        Settled,
+        Cancelled
+    }
+
+    enum AuctionCategory {
+        RealEstate,
+        ResidentialProperty,
+        CommercialProperty,
+        Land,
+        Vehicle,
+        Motorcycle,
+        Boat,
+        Aircraft,
+        Art,
+        Painting,
+        Sculpture,
+        Antiques,
+        Collectibles,
+        Jewelry,
+        Watches,
+        Electronics,
+        Computers,
+        Smartphones,
+        HomeAppliances,
+        Furniture,
+        Machinery,
+        Business,
+        DigitalAssets,
+        IntellectualProperty,
+        Books,
+        MusicalInstruments,
+        SportsEquipment,
+        Fashion,
+        Other
+    }
+    
     struct Auction {
         address beneficiary;
         uint256 commitEnd;
@@ -21,9 +63,11 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         bool exists;
         bool cancelled;
         uint256 reservePrice;
+        uint256 settledCount;
+        AuctionCategory category;
+        string metadataURI;
     }
     mapping (uint256 => Auction) public auctions;
-    
 
     struct Bidder {
         bytes32 commitment;
@@ -71,9 +115,10 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
     event AuctionFinalized(address indexed winner, uint256 indexed auctionId, uint256 winningBid);
     event BidSettled(address indexed bidder, uint256 indexed auctionId, uint256 refund, uint256 proceeds);
     event Withdrawal(address indexed account, uint256 indexed auctionId, uint256 amount);
-    event AuctionCreated(uint256 indexed auctionId, address indexed beneficiary, uint256 commitEnd, uint256 revealEnd);
+    event AuctionCreated(uint256 indexed auctionId, address indexed beneficiary, uint256 commitEnd, uint256 revealEnd, AuctionCategory category);
     event AuctionCancelled(uint256 indexed auctionId);
     event BidRevised(address indexed bidder, uint256 indexed auctionId);
+    event AuctionMetadataUpdated(uint256 indexed auctionId, string metadataURI);
 
     constructor() Ownable(msg.sender) {}
 
@@ -185,6 +230,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         if (b.settled) revert AlreadySettled();
 
         b.settled = true;
+        auctions[auctionId].settledCount++;
         uint256 refund;
         uint256 proceeds;
 
@@ -243,7 +289,14 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         );
     }
 
-    function createAuction(address _beneficiary, uint256 commitDuration, uint256 revealDuration, uint256 _reservePrice) external onlyOwner whenNotPaused returns(uint256 auctionId) {
+    function createAuction(
+        address _beneficiary,
+        uint256 commitDuration,
+        uint256 revealDuration,
+        uint256 _reservePrice,
+        AuctionCategory _category,
+        string calldata _metadataURI
+    ) external onlyOwner whenNotPaused returns(uint256 auctionId) {
         if (_beneficiary == address(0)) revert ZeroAddress();
         if (commitDuration == 0 || revealDuration == 0) {
             revert InvalidDuration();
@@ -264,10 +317,15 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
             finalized : false,
             exists : true,
             cancelled : false,
-            reservePrice : _reservePrice
+            reservePrice : _reservePrice,
+            settledCount : 0,
+            category : _category,
+            metadataURI : _metadataURI
         });
         _auctionId++;
-        emit AuctionCreated(auctionId, _beneficiary, _commitEnd, _revealEnd);
+
+        emit AuctionCreated(auctionId, _beneficiary, _commitEnd, _revealEnd, _category);
+        emit AuctionMetadataUpdated(auctionId, _metadataURI);
     }
 
     function cancelAuction(uint256 auctionId) external onlyOwner {
@@ -304,5 +362,56 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         b.bidRevised = true;
 
         emit BidRevised(msg.sender, auctionId);
+    }
+
+    function getAuctionState(
+        uint256 auctionId
+    ) external view returns (AuctionState) {
+        Auction storage auction = auctions[auctionId];
+
+        if (!auction.exists) revert AuctionNotFound();
+
+        if (auction.cancelled) {
+            return AuctionState.Cancelled;
+        }
+
+        if (
+            auction.finalized &&
+            auction.settledCount == auction.nextCommitOrder
+        ) {
+            return AuctionState.Settled;
+        }
+
+        if (auction.finalized) {
+            return AuctionState.Finalized;
+        }
+
+        if (block.timestamp < auction.commitEnd) {
+            return AuctionState.CommitPhase;
+        }
+
+        if (block.timestamp < auction.revealEnd) {
+            return AuctionState.RevealPhase;
+        }
+
+        return AuctionState.Ended;
+    }
+
+    function getAuctionCategory(uint256 auctionId) external view returns (AuctionCategory) {
+        if (!auctions[auctionId].exists) {
+            revert AuctionNotFound();
+        }
+
+        return auctions[auctionId].category;
+    }
+
+    function getAuctionMetadataURI(
+        uint256 auctionId
+    ) external view returns (string memory) {
+        if (!auctions[auctionId].exists) {
+            revert AuctionNotFound();
+        }
+    
+        return auctions[auctionId].metadataURI;
     }
 }
