@@ -1,14 +1,24 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-
-contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
+contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausable {
     uint256 public constant MIN_DURATION = 12 hours;
     uint256 public _auctionId = 1;
+
+    bytes32 public constant AUCTION_MANAGER_ROLE =
+    keccak256("AUCTION_MANAGER_ROLE");
+
+    bytes32 public constant PAUSER_ROLE =
+        keccak256("PAUSER_ROLE");
+
+    bytes32 public constant FEE_MANAGER_ROLE =
+    keccak256("FEE_MANAGER_ROLE");
 
     enum AuctionState {
         Created,
@@ -109,6 +119,7 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
     error BidBelowReservePrice();
     error BidAlreadyRevised();
     error DepositBelowReservePrice();
+    error InvalidMetadataURI();
 
     event BidCommitted(address indexed bidder, uint256 indexed auctionId);
     event BidRevealed(address indexed bidder,uint256 indexed auctionId, uint256 bid);
@@ -118,14 +129,19 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
     event AuctionCreated(uint256 indexed auctionId, address indexed beneficiary, uint256 commitEnd, uint256 revealEnd, AuctionCategory category);
     event AuctionCancelled(uint256 indexed auctionId);
     event BidRevised(address indexed bidder, uint256 indexed auctionId);
-    event AuctionMetadataUpdated(uint256 indexed auctionId, string metadataURI);
+    event AuctionMetadataSet(uint256 indexed auctionId, string metadataURI);
 
-    constructor() Ownable(msg.sender) {}
+    constructor() Ownable(msg.sender) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(AUCTION_MANAGER_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(FEE_MANAGER_ROLE, msg.sender);
+    }
 
-    function pause() external onlyOwner {
+    function pause() external onlyRole(PAUSER_ROLE) {
         _pause();
     }
-    function unpause() external onlyOwner {
+    function unpause() external onlyRole(PAUSER_ROLE) {
         _unpause();
     }
 
@@ -151,6 +167,9 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         if (_commitment == bytes32(0)) revert InvalidCommitment();
         if (bidders[auctionId][msg.sender].committed) revert AlreadyCommitted();
         if (msg.value == 0) revert ZeroDeposit();
+        if (msg.value < auctions[auctionId].reservePrice) {
+            revert DepositBelowReservePrice();
+        }
 
         bidders[auctionId][msg.sender] = Bidder({
             commitment: _commitment,
@@ -296,13 +315,16 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         uint256 _reservePrice,
         AuctionCategory _category,
         string calldata _metadataURI
-    ) external onlyOwner whenNotPaused returns(uint256 auctionId) {
+    ) external onlyRole(AUCTION_MANAGER_ROLE) whenNotPaused returns(uint256 auctionId) {
         if (_beneficiary == address(0)) revert ZeroAddress();
         if (commitDuration == 0 || revealDuration == 0) {
             revert InvalidDuration();
         }
         if (revealDuration < MIN_DURATION || commitDuration < MIN_DURATION) {
             revert InvalidDuration();
+        }
+        if (!_isValidMetadataURI(_metadataURI)) {
+            revert InvalidMetadataURI();
         }
         auctionId = _auctionId;
         uint256 _commitEnd = block.timestamp + commitDuration;
@@ -325,10 +347,28 @@ contract SealedBidAuction is Ownable, ReentrancyGuard, Pausable {
         _auctionId++;
 
         emit AuctionCreated(auctionId, _beneficiary, _commitEnd, _revealEnd, _category);
-        emit AuctionMetadataUpdated(auctionId, _metadataURI);
+        emit AuctionMetadataSet(auctionId, _metadataURI);
     }
 
-    function cancelAuction(uint256 auctionId) external onlyOwner {
+    function _isValidMetadataURI(string calldata uri) internal pure returns (bool) {
+        bytes memory data = bytes(uri);
+
+        // ipfs:// + 59 characters
+        if (data.length != 66) {
+            return false;
+        }
+
+        bytes memory scheme = bytes("ipfs://");
+
+        for (uint256 i = 0; i < 7; i++) {
+            if (data[i] != scheme[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function cancelAuction(uint256 auctionId) external onlyRole(AUCTION_MANAGER_ROLE) {
         Auction storage auction = auctions[auctionId];
 
         if (!auction.exists) revert AuctionNotFound();
