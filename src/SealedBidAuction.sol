@@ -8,8 +8,16 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausable {
-    uint256 public constant MIN_DURATION = 12 hours;
     uint256 public _auctionId = 1;
+    uint256 public constant MIN_DURATION = 12 hours;
+    uint256 public constant MAX_REPUTATION_SCORE = 1000;
+
+    uint256 public constant REVEAL_SUCCESS_POINTS = 10;
+    uint256 public constant SETTLEMENT_SUCCESS_POINTS = 20;
+    uint256 public constant WIN_BONUS_POINTS = 15;
+
+    uint256 public constant FAILED_REVEAL_PENALTY = 15;
+    uint256 public constant FAILED_SETTLEMENT_PENALTY = 25;
 
     bytes32 public constant AUCTION_MANAGER_ROLE =
     keccak256("AUCTION_MANAGER_ROLE");
@@ -98,6 +106,34 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
     mapping(uint256 => mapping(address => bool)) private whitelistedBidders;
     mapping (uint256 => mapping (address => uint256)) public pendingWithdrawals;
 
+    enum ReputationLevel {
+        Beginner,
+        Bronze,
+        Silver,
+        Gold,
+        Platinum
+    }
+
+    struct BidderReputation {
+        uint256 reputationScore;
+
+        uint256 totalAuctionsParticipated;
+
+        uint256 successfulReveals;
+        uint256 successfulSettlements;
+
+        uint256 failedReveals;
+        uint256 failedSettlements;
+
+        uint256 totalWins;
+        uint256 totalLosses;
+
+        uint256 totalBidsRevealed;
+        uint256 totalBidVolume;
+    }
+
+    mapping(address => BidderReputation) private bidderReputations;
+
     error ZeroAddress();
     error InvalidDuration();
     error CommitPhaseClosed();
@@ -128,6 +164,7 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
     error NotWhitelisted();
     error InvalidAddress();
     error WhitelistNotEnabled();
+    error InvalidReputationPoints();
 
     event BidCommitted(address indexed bidder, uint256 indexed auctionId);
     event BidRevealed(address indexed bidder,uint256 indexed auctionId, uint256 bid);
@@ -140,6 +177,7 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
     event AuctionMetadataSet(uint256 indexed auctionId, string metadataURI);
     event BidderWhitelisted(uint256 indexed auctionId, address indexed bidder);
     event BidderRemovedFromWhitelist(uint256 indexed auctionId, address indexed bidder);
+    event ReputationUpdated(address indexed bidder, int256 change, uint256 newScore);
 
     constructor() Ownable(msg.sender) {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -197,6 +235,12 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
             settled: false,
             bidRevised: false
         });
+
+        BidderReputation storage reputation =
+            bidderReputations[msg.sender];
+
+        reputation.totalAuctionsParticipated++;
+
         emit BidCommitted(msg.sender, auctionId);
     }
 
@@ -225,6 +269,19 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         if (expected != b.commitment) revert  InvalidReveal();
         b.revealed = true;
         b.revealedBid = bid;
+
+        BidderReputation storage reputation =
+            bidderReputations[msg.sender];
+
+        reputation.successfulReveals++;
+        reputation.totalBidsRevealed++;
+        reputation.totalBidVolume += bid;
+
+        _updateReputation(
+            msg.sender,
+            REVEAL_SUCCESS_POINTS,
+            true
+        );
 
         bool isBetter =
             bid > auctions[auctionId].highestBid ||
@@ -269,14 +326,44 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         uint256 refund;
         uint256 proceeds;
 
-        if(!b.revealed) {
+        BidderReputation storage reputation =
+            bidderReputations[bidder];
+
+        if (!b.revealed) {
             proceeds = b.deposit / 10;
             refund = b.deposit - proceeds;
+
+            reputation.failedReveals++;
+
+            _updateReputation(
+                bidder,
+                FAILED_REVEAL_PENALTY,
+                false
+            );
+
         } else if (bidder == auctions[auctionId].highestBidder) {
             proceeds = b.revealedBid;
             refund = b.deposit - b.revealedBid;
+
+            reputation.totalWins++;
+
+            _updateReputation(
+                bidder,
+                WIN_BONUS_POINTS,
+                true
+            );
+
         } else {
             refund = b.deposit;
+
+            reputation.successfulSettlements++;
+            reputation.totalLosses++;
+
+            _updateReputation(
+                bidder,
+                SETTLEMENT_SUCCESS_POINTS,
+                true
+            );
         }
 
         b.deposit = 0;
@@ -520,5 +607,71 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         if (!auctions[auctionId].exists) revert AuctionNotFound();
 
         return whitelistedBidders[auctionId][bidder];
+    }
+
+    function _updateReputation(
+        address bidder,
+        uint256 points,
+        bool increase
+    ) internal {
+        if (points == 0) revert InvalidReputationPoints();
+
+        if (points > uint256(type(int256).max)) {
+            revert InvalidReputationPoints();
+        }
+
+        BidderReputation storage reputation =
+            bidderReputations[bidder];
+
+        if (increase) {
+            uint256 remaining =
+                MAX_REPUTATION_SCORE - reputation.reputationScore;
+
+            if (points > remaining) {
+                reputation.reputationScore = MAX_REPUTATION_SCORE;
+            } else {
+                reputation.reputationScore += points;
+            }
+        } else {
+            if (points > reputation.reputationScore) {
+                reputation.reputationScore = 0;
+            } else {
+                reputation.reputationScore -= points;
+            }
+        }
+
+        int256 change = increase
+            ? int256(points)
+            : -int256(points);
+
+        emit ReputationUpdated(
+            bidder,
+            change,
+            reputation.reputationScore
+        );
+    }
+
+    function getBidderReputation(address bidder) external view
+        returns (BidderReputation memory)
+    {
+        if (bidder == address(0)) revert ZeroAddress();
+
+        return bidderReputations[bidder];
+    }
+
+    function getReputationLevel(address bidder) external view
+        returns (ReputationLevel)
+    {
+        if (bidder == address(0)) revert ZeroAddress();
+
+        uint256 score =
+            bidderReputations[bidder].reputationScore;
+
+        if (score < 100) return ReputationLevel.Beginner;
+        if (score < 300) return ReputationLevel.Bronze;
+        if (score < 600) return ReputationLevel.Silver;
+        if (score < 800) return ReputationLevel.Gold;
+
+        return ReputationLevel.Platinum;
     }
 }
