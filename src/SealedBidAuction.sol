@@ -20,6 +20,9 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
     bytes32 public constant FEE_MANAGER_ROLE =
     keccak256("FEE_MANAGER_ROLE");
 
+    bytes32 public constant WHITELIST_MANAGER_ROLE =
+    keccak256("WHITELIST_MANAGER_ROLE");
+
     enum AuctionState {
         Created,
         CommitPhase,
@@ -76,6 +79,7 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         uint256 settledCount;
         AuctionCategory category;
         string metadataURI;
+        bool whitelistEnabled;
     }
     mapping (uint256 => Auction) public auctions;
 
@@ -91,6 +95,7 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
     }
     
     mapping (uint256 => mapping (address => Bidder)) private bidders;
+    mapping(uint256 => mapping(address => bool)) private whitelistedBidders;
     mapping (uint256 => mapping (address => uint256)) public pendingWithdrawals;
 
     error ZeroAddress();
@@ -120,6 +125,9 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
     error BidAlreadyRevised();
     error DepositBelowReservePrice();
     error InvalidMetadataURI();
+    error NotWhitelisted();
+    error InvalidAddress();
+    error WhitelistNotEnabled();
 
     event BidCommitted(address indexed bidder, uint256 indexed auctionId);
     event BidRevealed(address indexed bidder,uint256 indexed auctionId, uint256 bid);
@@ -130,12 +138,15 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
     event AuctionCancelled(uint256 indexed auctionId);
     event BidRevised(address indexed bidder, uint256 indexed auctionId);
     event AuctionMetadataSet(uint256 indexed auctionId, string metadataURI);
+    event BidderWhitelisted(uint256 indexed auctionId, address indexed bidder);
+    event BidderRemovedFromWhitelist(uint256 indexed auctionId, address indexed bidder);
 
     constructor() Ownable(msg.sender) {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(AUCTION_MANAGER_ROLE, msg.sender);
         _grantRole(PAUSER_ROLE, msg.sender);
         _grantRole(FEE_MANAGER_ROLE, msg.sender);
+        _grantRole(WHITELIST_MANAGER_ROLE, msg.sender);
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {
@@ -170,7 +181,12 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         if (msg.value < auctions[auctionId].reservePrice) {
             revert DepositBelowReservePrice();
         }
-
+        if (
+            auctions[auctionId].whitelistEnabled &&
+            !whitelistedBidders[auctionId][msg.sender]
+        ) {
+            revert NotWhitelisted();
+        }
         bidders[auctionId][msg.sender] = Bidder({
             commitment: _commitment,
             deposit: msg.value,
@@ -266,7 +282,9 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         b.deposit = 0;
 
         if (refund > 0) pendingWithdrawals[auctionId][bidder] += refund;
-        if (proceeds > 0) pendingWithdrawals[auctionId][auctions[auctionId].beneficiary] += proceeds;
+        if (proceeds > 0) {
+            pendingWithdrawals[auctionId][auctions[auctionId].beneficiary] += proceeds;
+        }
 
         emit BidSettled(bidder, auctionId, refund, proceeds);
     }
@@ -314,7 +332,8 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         uint256 revealDuration,
         uint256 _reservePrice,
         AuctionCategory _category,
-        string calldata _metadataURI
+        string calldata _metadataURI,
+        bool _whitelistEnabled
     ) external onlyRole(AUCTION_MANAGER_ROLE) whenNotPaused returns(uint256 auctionId) {
         if (_beneficiary == address(0)) revert ZeroAddress();
         if (commitDuration == 0 || revealDuration == 0) {
@@ -342,7 +361,8 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
             reservePrice : _reservePrice,
             settledCount : 0,
             category : _category,
-            metadataURI : _metadataURI
+            metadataURI : _metadataURI,
+            whitelistEnabled : _whitelistEnabled
         });
         _auctionId++;
 
@@ -396,6 +416,13 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
 
         uint256 newDeposit = b.deposit + msg.value;
         if (newDeposit < auction.reservePrice) revert DepositBelowReservePrice();
+
+        if (
+            auction.whitelistEnabled &&
+            !whitelistedBidders[auctionId][msg.sender]
+        ) {
+            revert NotWhitelisted();
+        }
 
         b.commitment = newCommitment;
         b.deposit = newDeposit;
@@ -453,5 +480,45 @@ contract SealedBidAuction is Ownable2Step, AccessControl, ReentrancyGuard, Pausa
         }
     
         return auctions[auctionId].metadataURI;
+    }
+    
+    function addToWhitelist(
+        uint256 auctionId,
+        address bidder
+    ) external onlyRole(WHITELIST_MANAGER_ROLE) {
+        Auction storage auction = auctions[auctionId];
+
+        if (!auction.exists) revert AuctionNotFound();
+        if (auction.cancelled) revert AuctionAlreadyCancelled();
+        if (block.timestamp >= auction.commitEnd) revert CommitPhaseClosed();
+        if (!auction.whitelistEnabled) revert WhitelistNotEnabled();
+        if (bidder == address(0)) revert InvalidAddress();
+
+        whitelistedBidders[auctionId][bidder] = true;
+
+        emit BidderWhitelisted(auctionId, bidder);
+    }
+
+    function removeFromWhitelist(
+        uint256 auctionId,
+        address bidder
+    ) external onlyRole(WHITELIST_MANAGER_ROLE) {
+        Auction storage auction = auctions[auctionId];
+
+        if (!auction.exists) revert AuctionNotFound();
+        if (auction.cancelled) revert AuctionAlreadyCancelled();
+        if (block.timestamp >= auction.commitEnd) revert CommitPhaseClosed();
+        if (!auction.whitelistEnabled) revert WhitelistNotEnabled();
+        if (bidder == address(0)) revert InvalidAddress();
+
+        whitelistedBidders[auctionId][bidder] = false;
+
+        emit BidderRemovedFromWhitelist(auctionId, bidder);
+    }
+
+    function isWhitelisted(uint256 auctionId, address bidder) external view returns (bool) {
+        if (!auctions[auctionId].exists) revert AuctionNotFound();
+
+        return whitelistedBidders[auctionId][bidder];
     }
 }
